@@ -28,7 +28,7 @@ class TestApp(EClient, EWrapper):
     def historicalDataEnd(self, reqId, start, end):
         print(f"Historical Data Ended for {reqId}. Started at {start}, ending at {end}")
         self.cancelHistoricalData(reqId)
-
+        
 app = TestApp()
 app.connect("127.0.0.1", port, 0)
 threading.Thread(target=app.run).start()
