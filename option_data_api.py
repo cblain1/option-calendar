@@ -1,4 +1,3 @@
-
 import datetime
 import time
 import warnings
@@ -6,6 +5,8 @@ import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
 
+def get_risk_free_rate():
+    return 0.043 #todo placedolder
 
 # --- Helper: Date Formatting ---
 def format_ib_date(date_obj):
@@ -25,12 +26,12 @@ def format_output_date(date_str_ib):
 
 # --- Core API Data Fetching Functions ---
 
-def fetch_option_chains_list(ib: IB, ticker: str):
+def fetch_option_chains_list(app, ticker: str):
     """
     Fetches the list of option chain parameters (exchanges, expirations, strikes) for a ticker.
 
     Args:
-        ib (IB): Connected ib_insync IB instance.
+        app: Connected IB API client instance.
         ticker (str): The underlying stock ticker symbol.
 
     Returns:
@@ -38,7 +39,7 @@ def fetch_option_chains_list(ib: IB, ticker: str):
               and contains 'exchange', 'expirations' (list, YYYYMMDD),
               and 'strikes' (list, float). Returns empty list on failure.
     """
-    if not ib.isConnected():
+    if not app.isConnected():
         print("Error: IB is not connected.")
         return []
 
@@ -46,7 +47,7 @@ def fetch_option_chains_list(ib: IB, ticker: str):
     try:
         # Attempt to qualify the contract first to get the primary exchange if needed,
         # although reqSecDefOptParams usually works with SMART.
-        details = ib.reqContractDetails(stock_contract)
+        details = app.reqContractDetails(stock_contract)
         if not details:
              print(f"Error: Could not get contract details for {ticker}")
              return []
@@ -54,7 +55,7 @@ def fetch_option_chains_list(ib: IB, ticker: str):
         # print(f"DEBUG: Found conId {underlying_conId} for {ticker}")
 
         # Fetch option parameters
-        chains_params = ib.reqSecDefOptParams(ticker, '', 'STK', underlying_conId)
+        chains_params = app.reqSecDefOptParams(ticker, '', 'STK', underlying_conId)
         if not chains_params:
              print(f"Error: No option parameters found for {ticker} (conId: {underlying_conId})")
              return []
@@ -76,35 +77,35 @@ def fetch_option_chains_list(ib: IB, ticker: str):
         print(f"Error fetching option chain list for {ticker}: {e}")
         return []
 
-def get_current_underlying_price(ib: IB, ticker: str):
+def get_current_underlying_price(app, ticker: str):
     """
     Gets the current market price using Ticker.marketPrice() for the underlying stock.
 
     Args:
-        ib (IB): Connected ib_insync IB instance.
+        app: Connected IB API client instance.
         ticker (str): The underlying stock ticker symbol.
 
     Returns:
         float or None: The current price, or None if fetching fails.
     """
-    if not ib.isConnected():
+    if not app.isConnected():
         print("Error: IB is not connected.")
         return None
 
     stock_contract = Stock(ticker, 'SMART', 'USD')
     try:
         # Qualify is good practice even if not strictly needed for price sometimes
-        qualified_contracts = ib.qualifyContracts(stock_contract)
+        qualified_contracts = app.qualifyContracts(stock_contract)
         if not qualified_contracts:
              print(f"Error: Cannot qualify contract for stock {ticker}")
              return None
         qualified_stock = qualified_contracts[0] # Use the qualified contract
 
         # Request ticker data
-        ib.reqMktData(qualified_stock, '', False, False) # Request streaming update, snapshot=False
-        ib.sleep(1.0) # Allow time for data to arrive, might need adjustment/better handling
-        ticker_data: Ticker = ib.ticker(qualified_stock) # Retrieve the ticker object
-        ib.cancelMktData(qualified_stock) # Clean up the request
+        app.reqMktData(qualified_stock, '', False, False) # Request streaming update, snapshot=False
+        app.sleep(1.0) # Allow time for data to arrive, might need adjustment/better handling
+        ticker_data: Ticker = app.ticker(qualified_stock) # Retrieve the ticker object
+        app.cancelMktData(qualified_stock) # Clean up the request
 
         if ticker_data is None:
              print(f"Warning: Failed to retrieve ticker object for {ticker} after reqMktData.")
@@ -161,164 +162,162 @@ def get_nearby_expirations(expirations_list, days_out=60):
     return sorted(filtered_expirations) # Return sorted list
 
 
-def fetch_detailed_option_chain(ib: IB, ticker: str, expiration_date: str, exchange: str = 'SMART'):
+def fetch_detailed_option_chain(app, ticker: str, expiration_date: str, underlying_price: float, risk_free_rate: float, exchange: str = 'SMART'):
     """
-    Fetches detailed option data (strike, bid, ask, IV) for a specific expiration date.
-    Data is fetched for ALL strikes available for that expiration/exchange/tradingClass.
+    Fetches detailed option data (strike, bid, ask) and calculates Implied Volatility
+    using the provided 'implied_volatility' function for a specific expiration date.
 
     Args:
-        ib (IB): Connected ib_insync IB instance.
+        app: Connected IB API client instance.
         ticker (str): The underlying stock ticker symbol.
         expiration_date (str): The target expiration date in 'YYYY-MM-DD' format.
+        underlying_price (float): Current price of the underlying stock (S).
+        risk_free_rate (float): Annualized risk-free interest rate (r).
         exchange (str, optional): The exchange to use. Defaults to 'SMART'.
 
     Returns:
         dict or None: A dictionary containing two pandas DataFrames: 'calls' and 'puts'.
                       Returns None if fetching fails or no data is found.
-                      DataFrames contain columns: 'strike', 'bid', 'ask', 'impliedVolatility'.
+                      DataFrames contain columns: 'strike', 'impliedVolatility' (calculated),
+                      'bid' (fetched), 'ask' (fetched).
     """
-    if not ib.isConnected():
+    if not app.isConnected():
         print("Error: IB is not connected.")
         return None
 
     try:
-        # 1. Get chain parameters (including all strikes and trading class)
-        # It's slightly inefficient to call this every time, could be cached/passed
-        chain_list = fetch_option_chains_list(ib, ticker)
+        # 1. Calculate Time to Expiration (T) in years
+        today = datetime.date.today()
+        try:
+            exp_date_obj = datetime.datetime.strptime(expiration_date, "%Y-%m-%d").date()
+            # Add small epsilon to avoid T=0 on expiration day if needed by IV calc
+            time_to_expiry_days = (exp_date_obj - today).days
+            if time_to_expiry_days < 0:
+                 print(f"Warning: Expiration date {expiration_date} is in the past. Skipping.")
+                 return {'calls': pd.DataFrame(columns=['strike', 'impliedVolatility', 'bid', 'ask']),
+                         'puts': pd.DataFrame(columns=['strike', 'impliedVolatility', 'bid', 'ask'])}
+            # Use 365.25 for slightly more accuracy including leap years
+            T = max(time_to_expiry_days / 365.25, 1e-6) # Time in years, ensure > 0
+        except ValueError:
+             print(f"Error: Could not parse expiration date: {expiration_date}")
+             return None
+
+        # 2. Get chain parameters (strikes, trading class)
+        # (Slightly inefficient to call this every time, could be cached/passed)
+        chain_list = fetch_option_chains_list(app, ticker) # Assumes this function exists
         target_chain = None
         for chain in chain_list:
-            # Match on exchange AND ensure we find a tradingClass (use symbol if missing?)
             tc = chain.get('tradingClass', ticker)
             if chain.get('exchange') == exchange:
-                 # Heuristic: Prefer trading class matching the symbol if multiple exist for exchange
-                 if tc == ticker:
-                     target_chain = chain
-                     break
-                 elif target_chain is None: # Fallback to first match for the exchange
-                     target_chain = chain
-
+                 if tc == ticker: target_chain = chain; break
+                 elif target_chain is None: target_chain = chain
         if not target_chain:
              print(f"Error: Cannot find chain parameters for {ticker} on {exchange}")
              return None
-
         strikes = target_chain.get('strikes', [])
         if not strikes:
              print(f"Error: No strikes found for {ticker} on {exchange}")
              return None
-        # Use the specific tradingClass found for the target chain
         trading_class = target_chain.get('tradingClass', ticker)
-        print(f"DEBUG: Using TradingClass '{trading_class}' for {ticker} on {exchange}")
-
-        # 2. Convert expiration format YYYY-MM-DD back to YYYYMMDD
         ib_expiration_str = expiration_date.replace('-', '')
-
-        # Check if this expiration is valid for the selected chain
         if ib_expiration_str not in target_chain.get('expirations', []):
-             print(f"Error: Expiration {expiration_date} ({ib_expiration_str}) not found in parameters for {ticker} on {exchange}/{trading_class}.")
-             # This might happen if filtering logic upstream differs from actual IB params
+             print(f"Error: Expiration {expiration_date} not found in parameters for {ticker} on {exchange}/{trading_class}.")
              return None
 
-        # 3. Create Option contract objects for ALL strikes and both rights for THIS date
+        # 3. Create Option contract objects
         contracts_to_fetch = []
         for strike in strikes:
             for right in ['C', 'P']:
                 contracts_to_fetch.append(
                     Option(ticker, ib_expiration_str, float(strike), right, exchange, tradingClass=trading_class)
                 )
-
-        if not contracts_to_fetch:
-             print(f"Warning: No contracts generated for {ticker} {expiration_date}")
-             return None
+        if not contracts_to_fetch: return None
 
         # 4. Qualify contracts
-        qualified_contracts = ib.qualifyContracts(*contracts_to_fetch)
+        qualified_contracts = app.qualifyContracts(*contracts_to_fetch)
         print(f"DEBUG: Attempting to fetch market data for {len(qualified_contracts)} qualified contracts for {expiration_date}...")
-
         if not qualified_contracts:
-             print(f"Warning: No contracts qualified for {ticker} {expiration_date}")
-             # It's possible some strikes aren't valid for this specific date,
-             # but if ALL fail, it's likely an issue.
              return {'calls': pd.DataFrame(columns=['strike', 'impliedVolatility', 'bid', 'ask']),
                      'puts': pd.DataFrame(columns=['strike', 'impliedVolatility', 'bid', 'ask'])}
 
-
-        # 5. Fetch Ticker data - **VERIFY Bid/Ask/IV FIELD ACCESS**
-        # Use reqTickers as per user example, but ensure needed fields are populated.
-        # Consider adding specific genericTickList='106, ...' if needed for IV, etc.
-        # Or switch to multiple reqMktData calls if reqTickers is insufficient.
+        # 5. Fetch Ticker data (Bid, Ask, Last/Close)
         tickers_data = []
-        batch_size = 100 # IB limit is often ~100 simultaneous tickers
+        batch_size = 100
         for i in range(0, len(qualified_contracts), batch_size):
              batch = qualified_contracts[i:i+batch_size]
              print(f"DEBUG: Requesting tickers batch {i//batch_size + 1} (size {len(batch)})")
-             tickers_data.extend(ib.reqTickers(*batch))
-             ib.sleep(0.5) # Small delay between batches
+             # *** Ensure your reqTickers or equivalent gets Bid, Ask, Last/Close ***
+             tickers_data.extend(app.reqTickers(*batch))
+             app.sleep(0.5)
+        app.sleep(1.5) # Adjust wait time
 
-        # Wait for data to populate
-        ib.sleep(1.5) # Increased wait time for potentially many tickers, adjust as needed
-
-        # 6. Process the ticker data into DataFrames
+        # 6. Process the ticker data
         call_data = []
         put_data = []
         processed_conIds = set()
+        S = underlying_price # Use passed underlying price
+        r = risk_free_rate # Use passed risk-free rate
 
         for t in tickers_data:
-            # Sometimes duplicates might appear? Ensure unique processing
             if not t or not t.contract or t.contract.conId in processed_conIds: continue
             processed_conIds.add(t.contract.conId)
 
-            # --- !!! Placeholder Access - USER MUST VERIFY these attributes !!! ---
-            iv = None
-            # Try modelGreeks first (often needs separate reqMktData generic ticks 104/106)
-            if t.modelGreeks and t.modelGreeks.impliedVol is not None and not np.isnan(t.modelGreeks.impliedVol):
-                 iv = t.modelGreeks.impliedVol
-            # Fallback: Check if impliedVolatility field exists directly on ticker
-            # This might be populated by reqTickers sometimes, or specific reqMktData generic ticks
-            elif hasattr(t, 'impliedVolatility') and t.impliedVolatility is not None and not np.isnan(t.impliedVolatility):
-                 iv = t.impliedVolatility
-            # Last resort: Maybe IV is in optionComputation? (Less common on Ticker)
-            elif t.optionComputation and t.optionComputation.impliedVol is not None and not np.isnan(t.optionComputation.impliedVol):
-                 iv = t.optionComputation.impliedVol
-
+            # --- Get required data from Ticker ---
+            K = float(t.contract.strike)
+            right_char = t.contract.right # 'C' or 'P'
 
             bid = getattr(t, 'bid', None)
             ask = getattr(t, 'ask', None)
-            # ---------------------------------------------------------------------------------------
+            # Prioritize 'last' price, fallback to 'close' for IV calculation
+            market_price = getattr(t, 'last', None)
+            if not isinstance(market_price, (float, int)) or np.isnan(market_price) or market_price < 0: # Check validity of last
+                 market_price = getattr(t, 'close', None) # Fallback to close
 
-            # Clean up values
-            iv = float(iv) if isinstance(iv, (float, int)) and not np.isnan(iv) and iv > 0 else np.nan
+            # --- Clean fetched values ---
             bid = float(bid) if isinstance(bid, (float, int)) and not np.isnan(bid) and bid >= 0 else np.nan
             ask = float(ask) if isinstance(ask, (float, int)) and not np.isnan(ask) and ask >= 0 else np.nan
+            market_price = float(market_price) if isinstance(market_price, (float, int)) and not np.isnan(market_price) and market_price >= 0 else np.nan
 
-            # Additional check: Sometimes IV might be huge/error, filter unreasonable values?
-            if iv > 10.0: # Example: Filter IV > 1000% as likely error
-                 # print(f"Warning: High IV {iv:.2f} found for {t.contract.symbol} {t.contract.lastTradeDateOrContractMonth} {t.contract.strike} {t.contract.right}. Setting to NaN.")
-                 iv = np.nan
+            # --- Calculate Implied Volatility ---
+            calculated_iv = np.nan # Default to NaN
+            if not np.isnan(market_price) and market_price > 1e-6 : # Check if market price is valid and non-zero
+                try:
+                     # Call the provided IV function
+                     calculated_iv = implied_volatility(
+                         option_type=right_char,
+                         market_price=market_price,
+                         S=S, K=K, T=T, r=r
+                     )
+                     # Ensure calculated IV is reasonable (optional, depends on IV function)
+                     if not isinstance(calculated_iv, (float, int)) or np.isnan(calculated_iv) or calculated_iv < 0.001 or calculated_iv > 5.0: # e.g., 0.1% to 500%
+                          # print(f"Warning: Unreasonable calculated IV ({calculated_iv}) for {t.contract.localSymbol}. Setting to NaN.")
+                          calculated_iv = np.nan
+                except Exception as iv_e:
+                    print(f"Warning: Error calculating IV for {t.contract.localSymbol}: {iv_e}. MarketPrice={market_price}, S={S}, K={K}, T={T}, r={r}")
+                    calculated_iv = np.nan
+            # else:
+                # print(f"DEBUG: Skipping IV calculation for {t.contract.localSymbol} due to invalid market price: {market_price}")
+
 
             option_info = {
-                'strike': float(t.contract.strike),
-                'impliedVolatility': iv,
-                'bid': bid,
-                'ask': ask
+                'strike': K,
+                'impliedVolatility': calculated_iv, # Use calculated IV
+                'bid': bid,                   # Use fetched Bid
+                'ask': ask                    # Use fetched Ask
             }
 
-            if t.contract.right == 'C':
+            if right_char == 'C':
                 call_data.append(option_info)
-            elif t.contract.right == 'P':
+            elif right_char == 'P':
                 put_data.append(option_info)
 
-        # Create DataFrames
+        # 7. Create DataFrames
         calls_df = pd.DataFrame(call_data).sort_values(by='strike').reset_index(drop=True) if call_data else pd.DataFrame(columns=['strike', 'impliedVolatility', 'bid', 'ask'])
         puts_df = pd.DataFrame(put_data).sort_values(by='strike').reset_index(drop=True) if put_data else pd.DataFrame(columns=['strike', 'impliedVolatility', 'bid', 'ask'])
 
         print(f"DEBUG: Found {len(calls_df)} calls and {len(puts_df)} puts for {expiration_date}.")
-
-        # Add check for empty results after processing
         if calls_df.empty and puts_df.empty:
              print(f"Warning: No valid call or put data processed for {ticker} {expiration_date}")
-             # Return empty structure rather than None if the request succeeded but processing yielded nothing
-             return {'calls': calls_df, 'puts': puts_df}
-
 
         return {'calls': calls_df, 'puts': puts_df}
 
@@ -326,15 +325,16 @@ def fetch_detailed_option_chain(ib: IB, ticker: str, expiration_date: str, excha
         print(f"CRITICAL Error fetching detailed option chain for {ticker} {expiration_date}: {e}")
         import traceback
         traceback.print_exc()
-        return None # Return None on critical failure
+        return None
+
     
 
-def fetch_historical_price_data(ib: IB, ticker: str, period: str = '3mo'):
+def fetch_historical_price_data(app, ticker: str, period: str = '3mo'):
     """
     Fetches historical OHLCV data for the underlying stock.
 
     Args:
-        ib (IB): Connected ib_insync IB instance.
+        app: Connected IB API client instance.
         ticker (str): The underlying stock ticker symbol.
         period (str, optional): The duration string (e.g., '3mo', '1y'). Defaults to '3mo'.
                                 Needs mapping to IBKR 'durationStr'.
@@ -343,14 +343,14 @@ def fetch_historical_price_data(ib: IB, ticker: str, period: str = '3mo'):
         pd.DataFrame or None: DataFrame with 'Open', 'High', 'Low', 'Close', 'Volume'
                               columns and datetime index. Returns None on failure.
     """
-    if not ib.isConnected():
+    if not app.isConnected():
         print("Error: IB is not connected.")
         return None
 
     stock_contract = Stock(ticker, 'SMART', 'USD')
     try:
         # Qualify contract
-        cds = ib.reqContractDetails(stock_contract)
+        cds = app.reqContractDetails(stock_contract)
         if not cds:
              print(f"Error: Cannot find contract details for stock {ticker}")
              return None
@@ -372,7 +372,7 @@ def fetch_historical_price_data(ib: IB, ticker: str, period: str = '3mo'):
         durationStr, barSizeSetting = duration_map[period]
 
         # Request historical data
-        bars = ib.reqHistoricalData(
+        bars = app.reqHistoricalData(
             qualified_stock,
             endDateTime='', # Empty means current time
             durationStr=durationStr,

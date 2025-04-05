@@ -5,12 +5,14 @@ import threading
 
 port = 7496
 
-class TestApp(EClient, EWrapper):
+class ConnectionApp(EClient, EWrapper):
     def __init__(self):
         EClient.__init__(self, self)
+        self.connection_event = threading.Event()
 
     def nextValidId(self, orderId: OrderId):
         self.orderId = orderId
+        self.connection_event.set()  # Signal that connection is established
     
     def nextId(self):
         self.orderId += 1
@@ -27,15 +29,7 @@ class TestApp(EClient, EWrapper):
         print(f"Historical Data Ended for {reqId}. Started at {start}, ending at {end}")
         self.cancelHistoricalData(reqId)
         
-app = TestApp()
-app.connect("127.0.0.1", port, 0)
-threading.Thread(target=app.run).start()
-time.sleep(1)
-
-mycontract = Contract()
-mycontract.symbol = "AAPL"
-mycontract.secType = "STK"
-mycontract.exchange = "SMART"
-mycontract.currency = "USD"
-
-app.reqHistoricalData(app.nextId(), mycontract, "", "30 D", "1 Day", "TRADES", 1, 1, False, [])
+#app = TestApp()
+#app.connect("127.0.0.1", port, 0)
+#threading.Thread(target=app.run).start()
+#time.sleep(1)

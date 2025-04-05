@@ -19,6 +19,20 @@ from scipy.optimize import brentq
 
 import traceback # For detailed error printing
 
+# --- Constants ---
+TARGET_DAYS = [30, 60, 90, 180] # Target days out for analysis summary (can be adjusted)
+PLOT_MIN_DAYS = 20 # Min days out for expirations included in surface plot
+PLOT_MAX_DAYS = 400 # Max days out for expirations included in surface plot
+LIQUIDITY_THRESHOLDS = {'min_volume': 10, 'min_oi': 100, 'max_spread_pct': 0.25}
+SVI_FIT_THRESHOLDS = {'min_volume': 10, 'min_oi': 100, 'max_spread_pct': 0.20, 'min_vega': 0.005} # Adjusted min_vega
+NEAR_MONEY_PCT = 0.05 # For liquidity concentration calc
+RELATIVE_VOL_SD = 1.5 # Number of standard deviations for cheap/expensive vol
+_iv_debug_counter = 0 # Global counter for limited printing
+
+# --- Binomial Steps Constant ---
+# WARNING: Higher n increases accuracy but drastically increases runtime!
+BINOMIAL_STEPS = 75 # Adjust as needed (50-100 is typical)
+
 def get_risk_free_rate():
     """Fetches the 13-week Treasury Bill yield (^IRX) as a proxy for the risk-free rate."""
     try:
